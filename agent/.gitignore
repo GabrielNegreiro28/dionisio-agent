@@ -1,0 +1,24 @@
+# Segredos — NUNCA commitar
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# Dados locais / artefatos gerados
+_dump/
+benchtest_report.md
+
+# OS / editores
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
