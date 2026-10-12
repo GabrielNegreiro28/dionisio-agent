@@ -1,90 +1,98 @@
-# Dionísio Agent — Setup
+# Developer setup
 
-Agente de CRM para restaurante (Python puro). Guia de instalação e execução.
+For the project overview, see the [main README](../README.md). Design decisions are documented in [ARCHITECTURE.md](ARCHITECTURE.md), and runnable examples are in [DEMO.md](DEMO.md).
 
-> **Benchtest: 31 cenários, 127/127 checagens ✅** — leituras validadas com oráculos
-> contra a API, fluxo destrutivo com gate de confirmação, edge cases e multi-turno,
-> com telemetria de custo/latência por pedido. Relatório: `benchtest_report.md`.
-> Arquitetura e decisões de projeto: [`ARCHITECTURE.md`](ARCHITECTURE.md).
+## Prerequisites
 
-## 1. Requisitos
+- Python 3.10 or newer.
+- An OpenRouter API key.
+- A Dionisio CRM test API key and access to the external service.
 
-- Python **3.10+**
-- Uma API key do **OpenRouter** (`OPENROUTER_API_KEY`)
-- A API key do mock Dionísio (`DIONISIO_API_KEY`)
+The project uses Python orchestration, Pydantic-validated plans, and OpenRouter-hosted language models. Conversational examples and the current runtime interface are in Portuguese.
 
-## 2. Instalação
+## Install on Windows
+
+From the repository root:
+
+```powershell
+Set-Location .\agent
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+notepad .env
+```
+
+Configure these variables in your local `.env`:
+
+| Variable | Purpose |
+| --- | --- |
+| `DIONISIO_API_KEY` | Authentication for the external CRM test API. |
+| `OPENROUTER_API_KEY` | Authentication for the LLM provider. |
+| `LLM_MODEL` | Main planning/response model ID supported by your OpenRouter account. |
+| `LLM_MODEL_FAST` | Optional model override for lighter orchestration tasks. |
+
+Review the defaults in `config.py` and replace model IDs as needed for your provider access. Keep credentials in `.env`; commit only the credential-free example file.
+
+## Install on Linux or macOS
 
 ```bash
 cd agent
-
-# (recomendado) ambiente virtual
-python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# Linux/Mac:
-source .venv/bin/activate
-
-pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+test -f .env || cp .env.example .env
+# Edit .env with your credentials and supported model IDs.
+.venv/bin/python main.py --debug
 ```
 
-## 3. Configuração (`.env`)
+## Run on Windows
 
-Crie um arquivo `.env` dentro de `agent/`:
-
-```env
-DIONISIO_API_KEY=sua-key-do-mock
-OPENROUTER_API_KEY=sk-or-...
-LLM_MODEL=anthropic/claude-fable-5
+```powershell
+.\.venv\Scripts\python.exe main.py
+# Add --debug to inspect execution.
+.\.venv\Scripts\python.exe main.py --debug
 ```
 
-| Variável | Obrigatória | Padrão | Observação |
-|---|---|---|---|
-| `DIONISIO_API_KEY` | sim | — | key do mock Dionísio |
-| `OPENROUTER_API_KEY` | sim | — | key do OpenRouter |
-| `LLM_MODEL` | não | `anthropic/claude-fable-5` | id do modelo no OpenRouter (ex: `anthropic/claude-opus-4-5`, `openai/gpt-4o-mini`) |
-| `LLM_MODEL_FAST` | não | `anthropic/claude-haiku-4.5` | modelo barato para tarefas triviais (rewriter, classifier, memória) |
+Enter `sair` to leave the interactive session.
 
-## 4. Rodar o agente
+## Benchmark and tests
 
-```bash
-python main.py            # modo normal
-python main.py --debug    # mostra domínios, plano e passos
+These commands run from `agent/` with the environment configured:
+
+```powershell
+# Read-only benchmark by default; generates benchtest_report.md locally.
+.\.venv\Scripts\python.exe benchtest.py
+
+# Run a focused benchmark selection.
+.\.venv\Scripts\python.exe benchtest.py --only spend
+
+# Focused automated tests.
+.\.venv\Scripts\python.exe -m pip install pytest
+.\.venv\Scripts\python.exe -m pytest tools/test_openapi_sync.py execution/test_data_ops.py planning/test_plan_rules.py -q
 ```
 
-Digite `sair` para encerrar.
+`benchtest.py --mutating` also exercises destructive actions. Use disposable records in the test service for that mode. Live runs depend on API availability, credentials, and model access.
 
-## 5. (Opcional) Base de conhecimento
+## Inspect the API
 
-A documentação do produto (GitBook) já vem embutida em `knowledge/dionisio_docs.md`.
-Para atualizar:
-
-```bash
-python -m knowledge.ingest
+```powershell
+.\.venv\Scripts\python.exe probe.py tools
+.\.venv\Scripts\python.exe probe.py clients_inactive days=60
+.\.venv\Scripts\python.exe probe.py dump --out ./_dump
 ```
 
-## 6. Testes
+Dumped records can contain service data. Keep local inspection output out of version control.
 
-**Benchtest** (cenários ponta a ponta; precisa do `.env` configurado):
+## Product knowledge
 
-```bash
-python benchtest.py                 # modo seguro (não altera dados)
-python benchtest.py --mutating      # inclui ações destrutivas confirmadas
-python benchtest.py --only spend    # subconjunto por id
-```
-Gera `benchtest_report.md`.
+Product documentation is bundled in `knowledge/dionisio_docs.md`. To run the ingestion utility:
 
-**Sync do catálogo com o contrato OpenAPI** e **unit tests** (precisam de `pytest`):
-
-```bash
-pip install pytest
-python -m pytest tools/test_openapi_sync.py execution/test_data_ops.py planning/test_plan_rules.py -q
+```powershell
+.\.venv\Scripts\python.exe -m knowledge.ingest
 ```
 
-**Inspecionar a API mock direto** (verdade-base):
+## Troubleshooting
 
-```bash
-python probe.py tools                       # lista as ferramentas
-python probe.py clients_inactive days=60     # chama uma tool
-python probe.py dump --out ./_dump           # despeja as coleções
-```
+- **Missing API key:** check the local `.env` and run from `agent/`.
+- **Model unavailable:** set a supported `LLM_MODEL` / `LLM_MODEL_FAST` in `.env`.
+- **Service/authentication error:** verify CRM credentials and external service access.
+- **Unsupported operation:** inspect the tool catalog; the agent's capabilities are bounded by the exposed API.

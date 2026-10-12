@@ -1,90 +1,70 @@
-# Arquitetura — Dionísio Agent
+# Architecture and engineering decisions
 
-Agente de CRM para operadores de restaurante. Python puro, sem framework de agentes —
-cada camada é explícita, testável e auditável.
+This case study implements an explicit Python pipeline for a restaurant CRM assistant. Its central concern is the boundary between model-generated intent and executable operations.
 
-**Resultado do benchtest: 31 cenários, 127/127 checagens ✅** (leituras com oráculos
-contra a API, fluxo destrutivo com gate, edge cases, multi-turno). Ver `benchtest_report.md`,
-que inclui telemetria de custo e latência por pedido.
+## Request pipeline
 
-## Pipeline
+1. **Rewrite:** resolve conversational references using session history. The first turn can skip rewriting; subsequent requests can use a lighter model.
+2. **Classify:** identify customer, reservation, order, or coupon domains through keywords and an LLM fallback.
+3. **Select tools:** restrict the planning catalog to relevant domains, with a full-catalog fallback when needed.
+4. **Plan:** produce JSON nodes for API calls, deterministic computation, verification, and read-only fan-out. Validate the structure with Pydantic and allow one JSON repair attempt.
+5. **Execute:** resolve dependencies, run data operations, enforce risk checks, and pause destructive actions for confirmation. Replanning is bounded.
+6. **Respond:** describe execution results, including missing information, unsupported requests, and partial effects.
 
-```
-mensagem do operador
-        │
-        ▼
-┌─────────────────┐   só com histórico: resolve "dele", "essa reserva"…
-│ 1. REWRITER      │   (modelo rápido; pulado no 1º turno — zero custo)
-└─────────────────┘
-        │
-        ▼
-┌─────────────────┐   regras por palavra-chave + fallback LLM (modelo rápido)
-│ 2. CLASSIFIER    │   domínios: clients, reservations, orders, coupons, …
-└─────────────────┘
-        │
-        ▼
-┌─────────────────┐   catálogo restrito aos domínios (prompt menor/mais barato);
-│ 3. TOOL SELECT   │   fallback: catálogo COMPLETO se o plano falhar
-└─────────────────┘
-        │
-        ▼
-┌─────────────────┐   LLM gera um GRAFO TIPADO de nós (JSON validado por Pydantic):
-│ 4. PLANNER       │   api | compute | verify | fanout
-└─────────────────┘   1 tentativa de auto-reparo se o JSON vier inválido
-        │
-        ▼
-┌─────────────────┐   duas fases: SENSE (reversível) → ACT (escritas por último)
-│ 5. EXECUTOR      │   risk gate em toda chamada; confirmação p/ destrutivas;
-└─────────────────┘   replan com catálogo completo se um passo falhar
-        │
-        ▼
-┌─────────────────┐   LLM APENAS DESCREVE resultados já calculados —
-│ 6. RESPONSE      │   nunca conta, filtra ou soma (anti-alucinação)
-└─────────────────┘
-```
+## Typed plans and deterministic computation
 
-## Decisões de projeto e trade-offs
+The planner creates a structured execution graph rather than issuing arbitrary tool calls in an open-ended loop. Python implements filtering, lookup, counting, and sorting so that response generation does not need to recompute values.
 
-| Decisão | Por quê | Trade-off aceito |
-|---|---|---|
-| **Plano tipado (grafo JSON) em vez de loop ReAct** | Determinismo e auditabilidade: o plano inteiro é validado ANTES de executar; impossível "alucinar" uma tool no meio da execução | Menos flexível para tarefas exploratórias; replan cobre falhas |
-| **Nós `compute` determinísticos (filter/find/count/sort…)** | Tira contagem/filtragem do LLM — números na resposta vêm de código puro, não de geração de texto | O planner precisa aprender o vocabulário de ops (mitigado com exemplos no prompt) |
-| **Execução em duas fases (SENSE → ACT)** | Nenhuma escrita acontece antes de TODAS as leituras/verificações passarem; pré-valida cada escrita antes da primeira mutação | Escritas que alimentam passos posteriores não podem ser adiadas (ficam inline) |
-| **Risk gate + "confirmo" para destrutivas** | Ação irreversível nunca executa sem confirmação explícita; prompt mostra a entidade real ("João Silva", não só o id) | Um turno a mais de latência em operações destrutivas — de propósito |
-| **Resposta render-only (só descreve)** | A causa nº 1 de números errados em agentes é o LLM "recontar" — aqui ele recebe valores prontos e é instruído a não derivar nada | Pedidos cujo recorte não foi planejado retornam "não foi apurado" em vez de um chute |
-| **Desambiguação em `find` sensível** | `find` pega o 1º match — ok para leitura, inaceitável antes de cancelar/remarcar; com 2+ matches o agente PERGUNTA em vez de escolher | Um turno a mais quando há homônimos |
-| **Sem retry em escritas** | Um 5xx pode chegar DEPOIS do servidor ter persistido; sem chave de idempotência na API, retry cego pode duplicar efeito | Falha transitória numa escrita vira falha relatada (com oferta de compensação) |
-| **Modelo rápido para tarefas triviais** | Rewriter/classifier/resumo de memória não precisam do modelo principal — só pagariam latência e custo | Dois modelos para configurar (`LLM_MODEL`, `LLM_MODEL_FAST`) |
-| **Fanout paralelo (thread pool, só leituras)** | 31 chamadas dia-a-dia caem de ~90s para poucos segundos; escrita por elemento é BLOQUEADA (furaria a confirmação) | Limite de 8 conexões simultâneas contra a API |
-| **Sem framework (LangChain etc.)** | O caso pede raciocínio sobre segurança e arquitetura — cada decisão acima é visível no código, não escondida numa abstração | Mais código próprio para manter |
+**Trade-off:** explicit plans improve inspectability and make planning rules testable, while requiring custom graph execution and limiting flexibility to supported node types. Structural validation does not by itself prove that the chosen operations answer the user's question.
 
-## Tratamento de falhas (o que acontece quando algo dá errado)
+## Read/verify stages and writes
 
-| Falha | Comportamento |
-|---|---|
-| Plano JSON inválido | 1 auto-reparo (modelo vê o próprio erro); depois, falha limpa em PT-BR |
-| Classifier perdeu um domínio | Replan com o catálogo COMPLETO de tools |
-| Passo falha sem escrita anterior | Replan (até `MAX_REPLANS`) com resultados parciais como contexto |
-| Passo falha APÓS uma escrita | Status `partial`: lista o que foi feito + oferece compensação (ex: cupom criado → `coupons_deactivate`) |
-| Precondição `verify` falsa | `halted` com a mensagem do operador — nada irreversível aconteceu |
-| 2+ entidades para ação destrutiva | `needs_info`: lista os candidatos e pergunta qual |
-| Resultado gigante (fanout longo) | Contexto truncado com marcador `__truncado__` (total real preservado) — resposta nunca vem vazia |
-| Erro transitório em LEITURA | 1 retry; em ESCRITA, nunca (idempotência) |
-| Mesma reserva cancelada 2x na sessão | Bloqueado pelo risk gate (checagem de estado) |
+The executor uses sensing and action stages to perform reads and verification before deferred writes when dependencies allow. A write needed by later steps may still execute inline.
 
-## Telemetria (unit economics)
+**Trade-off:** this reduces avoidable early mutations but does not make a multi-step request atomic. Failures after a write can leave partial effects.
 
-Toda chamada LLM registra tokens, latência e custo (USD, via OpenRouter) em
-`clients/telemetry.py`. O `benchtest_report.md` traz custo médio por pedido e
-latência média/máxima da bateria; `python main.py --debug` mostra a telemetria
-de cada turno. Em produção isso vira o dado-base para precificar o agente por
-operação e dimensionar margem.
+## Confirmation and ambiguity
 
-## Limitações conhecidas
+Destructive operations pass through risk controls and request explicit confirmation. The CLI uses `confirmo` for approval. Rejected confirmation prevents the pending destructive action.
 
-- Sem ferramenta de mensagens/notificações e de gestão de cardápio — pedidos
-  assim entram em `unsupported` e o agente faz o que é possível (fulfillment parcial).
-- Desambiguação rastreia apenas referência direta `find → escrita destrutiva`;
-  um `find` encadeado por outro compute não é detectado.
-- Memória é por sessão (em processo); não persiste entre execuções.
-- Catálogo de tools é estático (sincronizado com o contrato OpenAPI por teste).
+Sensitive entity lookups with multiple candidates can return a clarification request. The existing disambiguation rule covers direct lookup-to-destructive-write paths; more complex dependency chains need additional coverage.
+
+## Failure handling
+
+| Failure | Behavior |
+| --- | --- |
+| Invalid plan JSON | Attempt one repair, then return a clear failure. |
+| Relevant domain omitted | Permit bounded replanning with the full tool catalog. |
+| Step fails before a mutation | Attempt bounded recovery where supported. |
+| Verification fails | Halt the affected execution path. |
+| Multiple sensitive lookup candidates | Request clarification. |
+| Write fails or later work fails after a write | Report partial status and performed actions; suggest compensation where appropriate. |
+| Unsupported menu or notification operation | Explain the missing capability and report any supported subset. |
+
+Reads can use retry behavior for transient errors. Writes are not automatically retried because the API does not expose idempotency keys. Compensation is advisory; there is no general transactional rollback.
+
+## Bounded concurrency and cost visibility
+
+Read-only fan-out uses a thread pool with up to eight connections and a configured fan-out limit of 31 items. Mutations are excluded from fan-out. Oversized results expose a truncation marker and total information.
+
+Lighter models can handle rewriting, classification, and memory-related tasks. Telemetry captures latency, token/cache usage, and provider-reported USD cost. This supports inspecting execution overhead without claiming a fixed cost or latency improvement.
+
+## Knowledge and state
+
+The repository includes product documentation, an ingestion utility, retrieval components, and in-process session memory. Session state is not persistent across restarts.
+
+The tool catalog is static. An OpenAPI consistency test helps detect mismatches, but catalog maintenance remains part of the development workflow.
+
+## Validation
+
+The original project documentation records **31 benchmark scenarios and 127/127 checks**. The checks include API-derived expectations for reads, confirmation behavior, edge cases, and multi-turn interactions. See the [original documentation](https://github.com/GabrielNegreiro28/dionisio-agent/blob/cc097642cca5891609eac3a7fa1d763d202bc65a/agent/ARCHITECTURE.md).
+
+Run `benchtest.py` to generate a fresh local report against the configured service. Focused tests cover data operations, planning rules, and OpenAPI/catalog synchronization. Follow [developer setup](README.md) for commands and prerequisites.
+
+## Next engineering steps
+
+- Persist sessions with an explicit lifecycle and storage model.
+- Broaden ambiguity checks across multi-step action chains.
+- Expand integration coverage for failures before and after writes.
+- Introduce idempotent write semantics where the API supports them.
+- Maintain tool/schema alignment as the external service changes.
